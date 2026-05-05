@@ -34,30 +34,6 @@ class MoveAnimation:
     duration_ms: int
 
 
-@dataclass(frozen=True)
-class WinStars:
-    """Immutable data class for level completion star rating system."""
-    clear: bool
-    time: bool
-    best_steps: bool
-
-    @property
-    def total(self) -> int:
-        """Calculate total stars (0-3)."""
-        return int(self.clear) + int(self.time) + int(self.best_steps)
-
-audio.play_bgm()
-
-
-@dataclass
-class MoveAnimation:
-    """Data class for vehicle movement animation state."""
-    vehicle_id: str
-    distance: int
-    elapsed_ms: int
-    duration_ms: int
-
-
 @dataclass
 class ShakeAnimation:
     """Data class for invalid move shake animation feedback."""
@@ -77,6 +53,7 @@ class UndoState:
     remove_remain: int
     total_remove_used: int
     total_removed_vehicles: int
+    remove_uses_this_level: int
 
 
 @dataclass(frozen=True)
@@ -156,6 +133,7 @@ class Game:
         
         # Undo system
         self._undo_stack: list[UndoState] = []
+        self._remove_uses_this_level = 0
         self._load_game_metadata()
         self._state_name = "MENU"
 
@@ -280,6 +258,7 @@ class Game:
         self.__remove_active = False
         self._remove_remain = 3
         self._undo_stack.clear()
+        self._remove_uses_this_level = 0
         self._initialize_mode_limits()
 
     def _reset_current_level(self) -> None:
@@ -297,6 +276,7 @@ class Game:
         self._remove_remain = 3
         self._result_buttons.clear()
         self._undo_stack.clear()
+        self._remove_uses_this_level = 0
         self._initialize_mode_limits()
 
     def _set_status(self, text: str, duration_ms: int = 2200, color=C.COLOR_TITLE2) -> None:
@@ -340,6 +320,7 @@ class Game:
             },
             "total_remove_used": self._total_remove_used,
             "total_removed_vehicles": self._total_removed_vehicles,
+            "remove_uses_this_level": self._remove_uses_this_level,
             "challenge_clears": dict(self._challenge_clears),
         }
 
@@ -504,6 +485,19 @@ class Game:
             self._won = bool(data.get("won", False))
             self._failed = bool(data.get("failed", False))
 
+            if "vehicles" in data:
+                ref_state = load_game_state(level_idx)
+                inferred_removes = max(
+                    0, len(ref_state.vehicles) - len(self._state.vehicles)
+                )
+                self._remove_uses_this_level = max(
+                    inferred_removes,
+                    max(0, int(data.get("remove_uses_this_level", 0))),
+                )
+            else:
+                self._remove_uses_this_level = 0
+
+            # Mode handling with validation
             mode = str(data.get("mode", C.MODE_NORMAL))
             if mode not in (C.MODE_NORMAL, C.MODE_LIMITED_TIME, C.MODE_LIMITED_STEP):
                 mode = C.MODE_NORMAL
@@ -563,43 +557,43 @@ class Game:
             return False
 
     def _time_star_limit_seconds(self, level_index: int) -> int:
-        """Get time limit for time star rating.
-        
-        Args:
-            level_index: Current level index
-        Returns:
-            Time limit in seconds
-        """
-        level_seconds = [35, 45, 55, 70]
+        # Normal mode time ★: L1 <=1min, L2 <=2.5min, L3 <=6.5min, L4 <=10min.
+        level_seconds = [60, 150, 390, 600]
         if 0 <= level_index < len(level_seconds):
             return level_seconds[level_index]
-        return 70
+        return level_seconds[-1]
+
+    @staticmethod
+    def _format_time_budget_text(seconds: int) -> str:
+        if seconds <= 0:
+            return "0s"
+        m, s = divmod(seconds, 60)
+        if m == 0:
+            return f"{s}s"
+        if s == 0:
+            return f"{m}min"
+        return f"{m}min {s}s"
+
+    def _step_star_limit(self, level_index: int) -> int:
+        # Normal mode step ★: L1 <=6, L2 <=16, L3 <=40, L4 <=60.
+        limits = [6, 16, 40, 60]
+        if 0 <= level_index < len(limits):
+            return limits[level_index]
+        return limits[-1]
 
     def _limited_time_seconds(self, level_index: int) -> int:
-        """Get time limit for time challenge mode.
-        
-        Args:
-            level_index: Current level index
-        Returns:
-            Time limit in seconds
-        """
-        limits = [30, 40, 50, 60]
+        # Time challenge (after 3★): 30s, 1min, 4min, 6min.
+        limits = [30, 60, 240, 360]
         if 0 <= level_index < len(limits):
             return limits[level_index]
-        return 60
+        return limits[-1]
 
     def _limited_step_count(self, level_index: int) -> int:
-        """Get step limit for step challenge mode.
-        
-        Args:
-            level_index: Current level index
-        Returns:
-            Maximum allowed steps
-        """
-        limits = [18, 24, 30, 36]
+        # Step challenge (after 3★): 4, 12, 33, 50 steps.
+        limits = [4, 12, 33, 50]
         if 0 <= level_index < len(limits):
             return limits[level_index]
-        return 36
+        return limits[-1]
 
     def _initialize_mode_limits(self) -> None:
         """Initialize time/step limits based on current game mode."""
@@ -690,10 +684,16 @@ class Game:
         """
         total_seconds = self._elapsed_ms // 1000
         time_limit = self._time_star_limit_seconds(self._level_index)
+        step_limit = self._step_star_limit(self._level_index)
+        clear = self._won
+        time_ok = total_seconds <= time_limit
+        step_ok = self._steps <= step_limit
+        if self._mode == C.MODE_NORMAL and self._remove_uses_this_level > 0:
+            return WinStars(clear=clear, time=False, best_steps=False)
         return WinStars(
-            clear=self._won,
-            time=total_seconds <= time_limit,
-            best_steps=self._is_new_best_steps(),
+            clear=clear,
+            time=time_ok,
+            best_steps=step_ok,
         )
 
     def _check_challenge_limits(self) -> None:
@@ -962,6 +962,7 @@ class Game:
             self._remove_remain -= 1
             self._total_remove_used += 1
             self._total_removed_vehicles += 1
+            self._remove_uses_this_level += 1
             audio.play_remove()
             return
 
@@ -1309,7 +1310,8 @@ class Game:
             remaining_steps=self._remaining_steps,
             remove_remain=self._remove_remain,
             total_remove_used=self._total_remove_used,
-            total_removed_vehicles=self._total_removed_vehicles
+            total_removed_vehicles=self._total_removed_vehicles,
+            remove_uses_this_level=self._remove_uses_this_level,
         )
         self._undo_stack.append(state)
         if len(self._undo_stack) > 50:
@@ -1327,7 +1329,8 @@ class Game:
         self._remove_remain = state.remove_remain
         self._total_remove_used = state.total_remove_used
         self._total_removed_vehicles = state.total_removed_vehicles
-        
+        self._remove_uses_this_level = state.remove_uses_this_level
+
         audio.play_undo()
 
     def _cell_rect_pixels(self, row: int, col: int) -> pygame.Rect:
@@ -1586,13 +1589,12 @@ class Game:
         if is_normal:
             stars = self._get_win_stars()
             time_limit = self._time_star_limit_seconds(self._level_index)
+            time_budget = self._format_time_budget_text(time_limit)
             time_target_surf = self._font_ui.render(
-                f"time target: <= {time_limit}%", True, C.COLOR_WIN_TEXT
+                f"time target: <= {time_budget}", True, C.COLOR_WIN_TEXT
             )
-            best_steps = self._best_steps_by_level.get(self._level_index)
-            best_steps_str = (
-                f"best step: {best_steps}" if best_steps is not None else "best step: -"
-            )
+            step_star_limit = self._step_star_limit(self._level_index)
+            best_steps_str = f"best step: <= {step_star_limit}"
             best_steps_surf = self._font_ui.render(
                 best_steps_str, True, C.COLOR_WIN_TEXT)
             score_surf = self._font_ui.render(
